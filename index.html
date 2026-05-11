@@ -1,0 +1,572 @@
+using Azure.Core;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Swashbuckle.AspNetCore.Annotations;
+using System;
+using System.Linq;
+using System.Reflection;
+using System.IO;
+using TipsNotifyRepo.Models;
+using TipsNotifyRepo.Models.Entities.HRMSystem;
+using TipsNotifyRepo.Models.Entities.MasterAuthorize;
+using TipsNotifyRepo.Models.Entities.TipsNotification;
+using TipsNotifyRepo.Services;
+using TipsNotifyRepo.Services.ChatCenter;
+using TipsNotifyRepo.Services.MessageCenter;
+using TipsNotifyRepo.Services.PermissionCenter;
+
+namespace TipsNotificationAPI.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    public class AdminController : ControllerBase
+    {
+        TipsNotificationContext _db;
+        HRMSystemContext _hrm;
+        IConfiguration _configuration;
+        MasterAuthorizeContext _masAuth;
+        TIPSMobilityServices _tipsMobility;
+        IWebHostEnvironment _env;
+        public AdminController(TipsNotificationContext db, IConfiguration configuration, HRMSystemContext hrm, MasterAuthorizeContext masAuth, TIPSMobilityServices tipsMobility, IWebHostEnvironment env)
+        {
+            _db = db;
+            _configuration = configuration;
+            _hrm = hrm;
+            _masAuth = masAuth;
+            _tipsMobility = tipsMobility;
+            _env = env;
+        }
+
+        //[Authorize(Roles = "TNA")]
+        [SwaggerIgnore]
+        [HttpGet("ClearMessages")]
+        public async Task<IActionResult> ClearMessages()
+        {
+            try
+            {
+                int count = 0;
+                int timing = 0;
+                int timingLimit = 4;
+                int take = 25;
+
+                var messageRetentionDays = int.Parse(_configuration["MessageSettings:MessageRetentionDays"]);
+                var lastWeek = DateTime.Now.AddDays(-messageRetentionDays);
+
+                while (timing < timingLimit)
+                {
+                    var messages = _db.TnMessages
+                        .Where(w => w.Created < lastWeek)
+                        .Take(take)
+                        .OrderBy(o => o.Created)
+                        .ToList();
+
+                    if (!messages.Any()) break;
+
+                    count += messages.Count;
+                    timing++;
+
+                    var mesIds = messages.Select(s => s.MesId).ToList();
+
+                    // Delete related entities in chunks
+                    await DeleteInChunks(_db.TnMessageImages.Where(w => mesIds.Contains(w.MesId)), 5);
+                    await DeleteInChunks(_db.TnMessageNotifications.Where(w => mesIds.Contains(w.MessageId)), 100);
+                    await DeleteInChunks(_db.TnMessageReadings.Where(w => mesIds.Contains(w.MesId)), 100);
+
+                    // Delete messages themselves
+                    _db.TnMessages.RemoveRange(messages);
+                    await _db.SaveChangesAsync();
+
+                    await Task.Delay(1000); // Optional cooldown before next batch
+                }
+
+                return Ok($"Messages cleared. {count} items");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError, ex.Message);
+            }
+        }
+
+        private async Task DeleteInChunks<T>(IQueryable<T> query, int chunkSize) where T : class
+        {
+            while (true)
+            {
+                var items = query.Take(chunkSize).ToList();
+
+                if (!items.Any())
+                    break;
+
+                _db.Set<T>().RemoveRange(items);
+                await _db.SaveChangesAsync();
+
+                await Task.Delay(500); // Optional: avoid database stress
+            }
+        }
+
+        [SwaggerIgnore]
+        [Authorize(Roles = "TNA")]
+        [HttpGet("ClearMessages_LinenotifyLog")]
+        public async Task<IActionResult> ClearMessages_LinenotifyLog()
+        {
+            try
+            {
+                var messages = _db.TnMessages.Where(w => w.Subject == "Line Notify");
+                var images = _db.TnMessageImages.Where(w => w.Mes.Subject == "Line Notify");
+                var readings = _db.TnMessageReadings.Where(w => w.Mes.Subject == "Line Notify");
+
+                _db.TnMessageImages.RemoveRange(images);
+                _db.TnMessageReadings.RemoveRange(readings);
+                _db.TnMessages.RemoveRange(messages);
+
+                //var count = await messages.CountAsync();
+
+                await _db.SaveChangesAsync();
+
+                return Ok("Messages cleared.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError, ex.Message);
+            }
+        }
+
+        [HttpGet("ClearMessageSpam")]
+        [SwaggerIgnore]
+        public async Task<IActionResult> ClearMessageSpam()
+        {
+            //https://localhost:7299/API/Admin/ClearMessageSpam
+            try
+            {
+                //var deplicateMessage = _db.TnMessages.Where(w=>w.)
+
+                return Ok("Messages cleared.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError, ex.Message);
+            }
+        }
+
+        [HttpGet("AddNewEmployeePrivateChat")]
+        [SwaggerIgnore]
+        public async Task<IActionResult> AddNewEmployeePrivateChat()
+        {
+            try
+            {
+                var employeePriChats = _db.TnChats.Where(w => w.PrivateNoti == true).Select(s => s.OwnerUserId).ToList();
+                var employeeIds = _hrm.ListEmployees.Where(w => w.IsActive == true && !employeePriChats.Contains(w.EmployeeNo)).Select(s => new
+                {
+                    EmployeeNo = s.EmployeeNo,
+                    EmployeeName = s.EmployeeName
+                }).ToList();
+
+                if (employeeIds.Count == 0)
+                {
+                    return Ok("No new employee to add.");
+                }
+
+                foreach (var emp in employeeIds)
+                {
+                    var chat = new TnChat
+                    {
+                        ChatName = emp.EmployeeNo,
+                        OwnerUserId = emp.EmployeeNo,
+                        Description = emp.EmployeeName,
+                        PrivateNoti = true
+                    };
+                    _db.TnChats.Add(chat);
+                }
+
+                await _db.SaveChangesAsync();
+
+                return Ok("successful " + employeeIds.Count + " items");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError, ex.Message);
+            }
+        }
+
+        [HttpGet("UpdateChatMember")]
+        [SwaggerIgnore]
+        public async Task<IActionResult> UpdateChatMember(int chatId)
+        {
+            try
+            {
+                var perFac = new PermissionFactory(_db, _hrm, _masAuth, _configuration);
+
+                var chat = _db.TnChats.Where(w => w.ChatId == chatId)
+                 .Include(c => c.TnChatPermissions)
+                 .Include(c => c.TnChatMutes)
+                 .FirstOrDefault();
+
+                if (chat == null) return NotFound("Chat not found.");
+
+                await UpdateChatMemberByTnChat(chat, perFac);
+
+
+                //var chat = _db.TnChats
+                // .Include(c => c.TnChatPermissions)
+                // .Include(c => c.TnChatMutes)
+                // .ToList();
+
+                //foreach (var c in chat)
+                //{
+                //    await UpdateChatMemberByTnChat(c, perFac);
+                //}
+
+                return Ok("successful");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError, ex.Message);
+            }
+        }
+
+        private async Task UpdateChatMemberByTnChat(TnChat chat, PermissionFactory perFac)
+        {
+            var memberList = await perFac.GetMemberByChatId(chat);
+
+            if (memberList == null || memberList.Count == 0) return;
+
+            var tnMemberList = memberList.Select(s => new TnChatMember
+            {
+                ChatId = chat.ChatId,
+                Username = s.Username,
+            }).ToList();
+
+            var chatMember = _db.TnChatMembers.Where(w => w.ChatId == chat.ChatId).ToList();
+            _db.TnChatMembers.RemoveRange(chatMember);
+            _db.TnChatMembers.AddRange(tnMemberList);
+
+            await _db.SaveChangesAsync();
+        }
+
+
+        [HttpGet("RuningNotifyMessageInprocess")]
+        [SwaggerIgnore]
+        public async Task<IActionResult> RuningNotifyMessageInprocess()
+        {
+            var startJob = DateTime.Now;
+            var totalMessage = 0;
+            var successMessage = 0;
+            var errorMessage = 0;
+            var countNotify = 0;
+            var countMobileNotify = 0;
+
+            try
+            {
+                var perFac = new PermissionFactory(_db, _hrm, _masAuth, _configuration);
+
+                var message = _db.TnMessages.Where(w => w.Status == "inprocess")
+                    .OrderBy(x => x.Created)
+                    .Take(100)
+                    .ToList();
+
+                if (message.Count == 0)
+                {
+                    return Ok("No message in process.");
+                }
+
+                totalMessage = message.Count;
+
+                var employeeList = _hrm.ListEmployees.Where(w => w.IsActive.Value).ToList();
+                var userinfos = _masAuth.SystemUserInfos.Where(w => w.UserStatus == "A").ToList();
+
+                var chatIds = message.Select(s => s.ChatId).Distinct().ToList();
+                var chats = _db.TnChats.Where(w => chatIds.Contains(w.ChatId))
+                    .Include(c => c.TnChatPermissions)
+                    .Include(c => c.TnChatMutes)
+                    .ToList();
+
+                foreach (var mes in message)
+                {
+                    var diffCreated = (DateTime.Now - mes.Created).TotalMinutes;
+
+                    if (diffCreated > 60)
+                    {
+                        mes.Status = "error";
+                        mes.LastRunning = DateTime.Now;
+                    }
+                    else
+                    {
+
+                        var timeElapsed = DateTime.Now - startJob;
+                        if (timeElapsed.TotalMinutes > 2) break;
+
+                        var chat = chats.Where(w => w.ChatId == mes.ChatId).FirstOrDefault();
+
+                        var mesNotiList = new List<TnMessageNotification>();
+
+                        if (chat == null)
+                        {
+                            mes.Status = "chat not found";
+                            errorMessage++;
+                            continue;
+                        }
+
+                        var memberList = await perFac.GetMemberByChatId(chat, employeeList, userinfos);
+
+                        if (memberList != null && memberList.Count > 0)
+                        {
+
+                            foreach (var member in memberList)
+                            {
+                                var mesNoti = new TnMessageNotification
+                                {
+                                    MessageId = mes.MesId,
+                                    Username = member.Username,
+                                    Fullname = member.Fullname,
+                                    Mute = member.Mute,
+                                    Created = DateTime.Now,
+                                    IsTips = member.TIPSEmployee
+                                };
+
+                                if (mesNoti.Mute)
+                                {
+                                    mesNoti.Status = "successful";
+                                }
+                                else if (!member.TIPSEmployee)
+                                {
+                                    mesNoti.Status = "successful";
+                                }
+                                else
+                                {
+                                    try
+                                    {
+                                        var result = await MobileNotify(member.Username, mes.Message, chat.ChatName);
+
+                                        if (result.Value == "SUCCESS")
+                                        {
+                                            mesNoti.Notified = DateTime.Now;
+                                            mesNoti.Status = "successful";
+                                            mesNoti.StatusDesc = "Notify Successful";
+                                            countMobileNotify++;
+                                        }
+                                        else
+                                        {
+                                            mesNoti.Status = "error";
+                                            mesNoti.StatusDesc = $"TIPS Mobility Error : value{{{result.Value}}},{{{result.Message}}}";
+                                        }
+
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        mesNoti.Status = "error";
+                                        mesNoti.StatusDesc = ex.Message;
+                                    }
+                                }
+
+                                mesNotiList.Add(mesNoti);
+                                countNotify++;
+                            }
+
+                        }
+
+                        if (mesNotiList.Where(w => w.Status != "successful").Count() > 0 || memberList == null)
+                        {
+                            mes.Status = "error";
+                            errorMessage++;
+                        }
+                        else
+                        {
+                            mes.Status = "successful";
+                            successMessage++;
+                        }
+
+                        if (mesNotiList.Any())
+                        {
+                            _db.TnMessageNotifications.AddRange(mesNotiList);
+                        }
+
+                        mes.LastRunning = DateTime.Now;
+                    }
+
+                    _db.SaveChanges();
+                }
+
+                return Ok($"Runing Notify {successMessage} messages, {countNotify} notifications.");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError, ex.Message);
+            }
+            finally
+            {
+                if (totalMessage > 0)
+                {
+                    await WriteProcessLog(startJob, DateTime.Now, totalMessage, successMessage, errorMessage, countMobileNotify);
+                }
+            }
+        }
+
+        private async Task WriteProcessLog(DateTime start, DateTime end, int total, int success, int error, int mobileNotify)
+        {
+            try
+            {
+                string logPath = Path.Combine(_env.ContentRootPath, "Logs", start.ToString("yyyyMM"));
+                if (!Directory.Exists(logPath))
+                {
+                    Directory.CreateDirectory(logPath);
+                }
+
+                string fileName = Path.Combine(logPath, start.ToString("yyyyMMdd") + ".log");
+                string logContent = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Start: {start:HH:mm:ss}, End: {end:HH:mm:ss}, Total: {total}, Success: {success}, Error: {error}, MobileNotify: {mobileNotify}{Environment.NewLine}";
+
+                await System.IO.File.AppendAllTextAsync(fileName, logContent);
+            }
+            catch (Exception)
+            {
+                // Silent error for logging
+            }
+        }
+
+        [HttpGet("ReRuningNotifyErrorMessage")]
+        [SwaggerIgnore]
+        public async Task<IActionResult> ReRuningNotifyErrorMessage()
+        {
+            DateTime now = DateTime.Now;
+            //DateTime now = DateTime.ParseExact("20250326 16:10", "yyyyMMdd HH:mm", null);
+
+            // กำหนดช่วงเวลา 15 นาที
+            int intervalMinutes = 5;
+            int rangMin = 15;
+
+            // ปัดเศษเวลาย้อนกลับให้ตรงกับช่วงเวลา
+            DateTime rounded = new DateTime(
+                now.Year,
+                now.Month,
+                now.Day,
+                now.Hour,
+                now.Minute / intervalMinutes * intervalMinutes,
+                0
+            );
+
+            var start = rounded.AddMinutes(-rangMin);
+            var end = rounded;
+
+            var messages = _db.TnMessages.Where(w => w.TnMessageNotifications.Where(w2 => w2.Created >= start && w2.Created < end && w2.Status == "error").Count() > 0)
+                .Include(c => c.TnMessageNotifications.Where(w => w.Status == "error"))
+                .Include(c => c.Chat)
+                .ToList();
+
+            if (messages.Any())
+            {
+                var total = messages.SelectMany(s => s.TnMessageNotifications).Count();
+                var successfulCount = 0;
+
+                foreach (var tbMessage in messages)
+                {
+                    foreach (var item in tbMessage.TnMessageNotifications)
+                    {
+                        try
+                        {
+                            //item.Notified = DateTime.Now;
+                            //item.Status = "successful";
+                            //item.StatusDesc = "force success";
+                            //successfulCount++;
+
+                            var result = await MobileNotify(item.Username, item.Message.Message, item.Message.Chat.ChatName);
+                            if (result.Value == "SUCCESS")
+                            {
+                                item.Notified = DateTime.Now;
+                                item.Status = "successful";
+                                item.StatusDesc = "Notify Successful";
+                                successfulCount++;
+                            }
+                            else
+                            {
+                                item.Status = "error";
+                                item.StatusDesc = $"TIPS Mobility Error : value{{{result.Value}}},{{{result.Message}}}";
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            item.Status = "error";
+                            item.StatusDesc = ex.Message;
+                        }
+
+                    }
+
+                    if (tbMessage.TnMessageNotifications.Where(w => w.Status == "error").Count() == 0)
+                    {
+                        tbMessage.Status = "successful";
+                    }
+                    _db.SaveChanges();
+                }
+
+                string message = $"Re running Error Sending on {start:dd/MM/yyyy HH:mm}-{end:HH:mm} Total:{total} Success:{successfulCount} Error:{total - successfulCount}";
+
+                MessageFactory messageFactory = new MessageFactory(_db, _hrm, _masAuth, _configuration);
+                await messageFactory.PushMessageByChatName(new PushMessageByChatNameRequest
+                {
+                    ChatName = "TIPS Notification Monitor",
+                    Subject = "Re running Error Sending",
+                    Message = message,
+                }, "Power Automate");
+
+                return Ok(message);
+            }
+
+            return Ok("No message in error status.");
+        }
+        private async Task<TIPSMobilityResponse?> MobileNotify(string emplyeeNo, string message, string ChatName)
+        {
+            string subMessage(string message) => message.Length > 50 ? message.Substring(0, 50) + "..." : message;
+            string subSubject(string subject) => subject.Length > 15 ? subject.Substring(0, 15) + "..." : subject;
+
+            return await _tipsMobility.PushMessage(new TIPSMobilityPushMessage_Request
+            {
+                employeeno = emplyeeNo,
+                body = subMessage(message),
+                title = subSubject(ChatName),
+            });
+        }
+
+        //เคลียร์การแจ้งเตือนซ้ำ
+        [HttpGet("ClearDuplicateNotification")]
+        [SwaggerIgnore]
+        public async Task<IActionResult> ClearDuplicateNotification()
+        {
+            var today = DateTime.Now.Date;
+
+            var notification = _db.TnMessageNotifications
+                .AsNoTracking()
+                .Where(w => w.Created >= today)
+                .GroupBy(g => new { g.MessageId, g.Username })
+                .Where(w => w.Count() > 1)
+                .Select(s => new
+                {
+                    s.Key.MessageId,
+                    s.Key.Username,
+                    Count = s.Count(),
+                    Ids = s.OrderBy(o => o.Id).Select(ss => ss.Id).ToList()
+                })
+                .OrderByDescending(o => o.Count)
+                .ToList();
+
+            foreach (var item in notification)
+            {
+                //Keep the last record with status = 'successful', if none then remove the last record with 'error', delete the rest.
+
+                var notiList = _db.TnMessageNotifications.Where(w => w.MessageId == item.MessageId && w.Username == item.Username).OrderByDescending(o => o.Id).ToList();
+                var keepNoti = notiList.Where(w => w.Status == "successful").FirstOrDefault();
+                if (keepNoti == null)
+                {
+                    keepNoti = notiList.Where(w => w.Status == "error").FirstOrDefault();
+                }
+                notiList.Remove(keepNoti);
+                _db.TnMessageNotifications.RemoveRange(notiList);
+
+                await _db.SaveChangesAsync();
+
+
+                await Task.Delay(5000);
+            }
+
+            return Ok("No implementation.");
+        }
+    }
+}
